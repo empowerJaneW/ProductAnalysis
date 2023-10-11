@@ -1,0 +1,105 @@
+-- Get the first subscription for each user
+DROP TABLE IF EXISTS #first_sub
+SELECT 
+a.UserId
+,UserSubscriptionId
+,firstsubdate 
+INTO #first_sub
+FROM (SELECT UserId, min(StartDate) AS firstsubdate FROM usersubscription GROUP BY userid) a 
+LEFT JOIN usersubscription b
+ON a.UserId = b.UserId AND a.firstsubdate = b.StartDate
+WHERE firstsubdate >= '2023-01-01'
+AND firstsubdate < '2023-05-01';
+
+-- Identify highest CA offer made within 14 day trial
+DROP TABLE IF EXISTS #CA_offers
+SELECT 
+max(amounteligible) as highest_CA_offer
+, UserSubscriptionId
+, a.UserId
+, firstsubdate
+INTO #CA_offers
+FROM #first_sub a
+LEFT JOIN UserCreditVariable b
+ON a.UserId = b.UserId
+AND DateGenerated < DATEADD(Day,14,firstsubdate)
+AND DateGenerated > DATEADD(Hour,-1,firstsubdate)
+LEFT JOIN UserCashAdvanceEligibility c
+ON b.UserCreditVariableId = c.UserCreditVariableId
+WHERE IsOfferShownToUser = 1
+GROUP BY UserSubscriptionId
+, a.UserId
+, firstsubdate
+;
+
+-- Check for distinct entries
+-- SELECT --count(userid), count(distinct userid), 
+-- count(UserSubscriptionId), count(distinct UserSubscriptionId) 
+-- FROM #invoice;
+
+-- Did they have an invoice generated and did they pay at least once
+DROP TABLE IF EXISTS #invoice
+SELECT 
+a.UserSubscriptionId
+, a.UserId
+, sum(CASE WHEN UserSubscriptionInvoiceId IS NOT NULL THEN 1 ELSE 0 END) AS num_invoices_generated
+, sum(CASE WHEN InvoiceStatus = 0 THEN 1 ELSE 0 END ) AS num_created
+, sum(CASE WHEN InvoiceStatus = 1 THEN 1 ELSE 0 END ) AS num_pending
+, sum(CASE WHEN InvoiceStatus = 2 THEN 1 ELSE 0 END ) AS num_paid
+, sum(CASE WHEN InvoiceStatus >= 3 THEN 1 ELSE 0 END ) AS num_unpaid
+INTO #invoice
+FROM #CA_offers a 
+LEFT JOIN UserSubscriptionInvoice b 
+ON a.UserSubscriptionId = b.UserSubscriptionId
+GROUP BY a.UserSubscriptionId, a.UserId;
+
+-- select max(num_invoices_generated) from #invoice
+
+
+DROP TABLE IF EXISTS #survey_data
+SELECT 
+a.UserSubscriptionId,
+a.userid,
+num_invoices_generated,
+num_paid,
+highest_CA_offer
+,CustomResponse
+, CASE WHEN customresponse is null then 0 when customresponse = '' then 0 else 1 end as custom_flag
+,responsetext
+,CASE WHEN ParentSurveyResponseId = 1 THEN 'Cash Advance Issue'
+when ParentSurveyResponseId = 2 THEN 'Empower Card/Checking Issue'
+when [ParentSurveyResponseId] = 3 THEN 'Budgeting/AutoSave Issue'
+when [ParentSurveyResponseId] = 4 THEN 'Unsatisfied with customer support'
+when [ParentSurveyResponseId] = 5 THEN 'Found the app confusing'
+when [ParentSurveyResponseId] is null THEN ResponseText
+END as PrimaryReason
+INTO #survey_data
+FROM #invoice a 
+LEFT JOIN #CA_offers b 
+ON a.UserSubscriptionId = b.UserSubscriptionId
+LEFT JOIN
+    (SELECT distinct(userid), ParentSurveyResponseId, CustomResponse, responsetext 
+        FROM UserSurveyResponse usr 
+        inner join SurveyResponse sr on sr.surveyresponseid=usr.surveyresponseid
+        left join surveyresponsehierarchy srh on usr.surveyresponseid=srh.childsurveyresponseid
+        where surveyquestionid IN (1,2)) as c on a.userid=c.userid
+;
+
+
+SELECT
+count(UserSubscriptionId) as users
+, num_invoices_generated
+, num_paid
+, highest_CA_offer
+, PrimaryReason
+, ResponseText
+, custom_flag
+FROM #survey_data
+GROUP BY 
+ num_invoices_generated
+, num_paid
+, highest_CA_offer
+, PrimaryReason
+, ResponseText
+, custom_flag
+;
